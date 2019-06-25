@@ -830,11 +830,11 @@ class GWAS(object):
         pbar.update()
         return linregress_result
 
-    @staticmethod
-    def linregress(param_tuple):
-        x, y = param_tuple
-        linregress_result = linregress(x, y)
-        return linregress_result
+    # @staticmethod
+    # def linregress(x, y):#param_tuple):
+    #     #x, y = param_tuple
+    #     linregress_result = linregress(x, y)
+    #     return linregress_result
 
     @staticmethod
     #@jit(parallel=True)
@@ -928,7 +928,7 @@ class GWAS(object):
                                                                          )
             # Get apropriate function for linear regression
             func = self.nu_linregress if high_precision else self.st_mod \
-                if stmd else self.linregress
+                if stmd else linregress
             daskpheno = da.from_array(y_train.PHENO,
                                       chunks=(y_train.PHENO.shape[0])).astype(
                 float)
@@ -944,12 +944,13 @@ class GWAS(object):
                     x_train.shape[1])), [daskpheno])
 
             tq = dict(desc='Performing regressions', total=x_train.shape[1])
-            print(x_train.shape, daskpheno.shape, x_train.numblocks, daskpheno.numblocks)
+            print(x_train.shape, daskpheno.shape, x_train.numblocks,
+                  daskpheno.numblocks)
             lr = LinearRegression()
             print('Performing regressions')
             with ProgressBar(), Client(LocalCluster()):
                 r = x_train.map_blocks(func, daskpheno, dtype=np.float,
-                                       new_axis=[]).compute()
+                                       ).compute()
             # with Pool(self.threads) as p, tqdm(**tq) as pbar, \
             #         warnings.catch_warnings():
             #     warnings.simplefilter('ignore')
