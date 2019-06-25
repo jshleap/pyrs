@@ -865,11 +865,15 @@ class GWAS(object):
         f = h5py.File(gfn, 'r')  # Read the genotype h5 file
         chunks = np.load('chunks.npy')  # Load the chunks stored
         # Estimate chunk sizes given the number of threads
-        chunks = [estimate_chunks(tuple(i), self.threads) for i in chunks]
+        #chunks = [estimate_chunks(tuple(i), self.threads) for i in chunks]
         # Get training set of the genotype array
-        x_train = da.from_array(f.get('x_train'), chunks=tuple(chunks[0]))
+        #x_train = da.from_array(f.get('x_train'), chunks=tuple(chunks[0]))
+        x_train = da.from_array(f.get('x_train'))
+        x_train.rechunk((x_train.shape[0], 1))
         # Get the test set of the genotype array
-        x_test = da.from_array(f.get('x_test'), chunks=tuple(chunks[1]))
+        x_test = da.from_array(f.get('x_test'))
+        x_test.rechunk((x_test.shape[0], 1))
+        # x_test = da.from_array(f.get('x_test'), chunks=tuple(chunks[1]))
         # Get the training set of the phenotype
         y_train = pd.read_hdf(pfn, key='y_train')
         # Get the testing set of the phenotype
@@ -912,8 +916,9 @@ class GWAS(object):
             y_test.to_csv('%s_testIDs.txt' % self.outpref, **opts)
             y_train.to_csv('%s_trainIDs.txt' % self.outpref, **opts)
             if isinstance(x_train, dask.array.core.Array):
-                x_train = x_train.rechunk(
-                    estimate_chunks(x_train.shape, threads, max_memory))
+                x_train = x_train.rechunk((x_train.shape[0], 1))
+                # x_train = x_train.rechunk(
+                #     estimate_chunks(x_train.shape, threads, max_memory))
             if 'normalize' in kwargs:
                 if kwargs['normalize']:
                     print('Normalizing train set to variance 1 and mean 0')
@@ -940,8 +945,9 @@ class GWAS(object):
             tq = dict(desc='Performing regressions', total=x_train.shape[1])
             print(x_train.shape, daskpheno.shape)
             lr = LinearRegression()
+            print('Performing regressions')
             with ProgressBar(), Client(LocalCluster()):
-                r = x_train.apply(lr.fit, 1, x_train, daskpheno)
+                r = x_train.map_blocks(func).compute()
             # with Pool(self.threads) as p, tqdm(**tq) as pbar, \
             #         warnings.catch_warnings():
             #     warnings.simplefilter('ignore')
