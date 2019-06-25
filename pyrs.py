@@ -35,31 +35,35 @@ import dill
 import psutil
 import operator
 import argparse
+import warnings
 import matplotlib
 import numpy as np
 import pandas as pd
 import mpmath as mp
 from numba import jit
+from tqdm import tqdm
 from chest import Chest
 import dask.array as da
-from itertools import cycle
+from igraph import Graph
+from copy import deepcopy
 import dask.dataframe as dd
 from functools import reduce
 from dask.array.core import Array
 from collections import namedtuple
 from scipy.stats import linregress
 from pandas_plink import read_plink
-from dask.distributed import Client
 from joblib import Parallel, delayed
 from multiprocessing import cpu_count
-import statsmodels.formula.api as smf
+#import statsmodels.formula.api as smf
 from sklearn.decomposition import PCA
+from dask_jobqueue import SLURMCluster
 from dask.diagnostics import ProgressBar
-from multiprocessing.pool import ThreadPool
+from itertools import cycle, product, chain
 from qtraitsimulation import qtraits_simulation
-from dask.distributed import Client, LocalCluster
-from sklearn.model_selection import train_test_split
-
+from multiprocessing.pool import ThreadPool, Pool
+from dask_ml.model_selection import train_test_split
+from dask.distributed import Client, LocalCluster, as_completed
+from dask_ml.linear_model import LinearRegression
 
 
 mp.dps = 25
@@ -68,16 +72,73 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 plt.style.use('ggplot')
 
-lr = jit(linregress)
+lr = dask.delayed(linregress)
+
+
+def single_locus_clump(clump, sum_stats):
+    tag = clump.vs['label']
+    sub_stats = sum_stats[sum_stats.snp.isin(tag)]
+    index = sub_stats.nsmallest(1, 'pvalue')
+    key = (index.snp.values[0], index.pvalue.values[0])
+    return key, sub_stats
+
+
+def clumps(sum_stats, locus, ld_thr):
+    """
+    Get clumps from locus helper function to multiprocess
+    :param sum_stats: subset of the summary statistics for the locus
+    :param ld_threshold: the threshold for this run
+    """
+    snp_list, d = locus
+    # Name the rows and columns
+    snp_list = snp_list.to_list()
+    gr = Graph.Adjacency((d ** 2 > ld_thr).tolist())
+    gr.vs['label'] = snp_list
+    grs = gr.components().subgraphs()
+    clumped = [single_locus_clump(clump, sum_stats) for clump in grs]
+    return ld_thr, dict(clumped)
+
+
+def just_score(index_snp, sumstats, pheno, geno):
+    clump = sumstats[sumstats.snp.isin(index_snp)]
+    idx = clump.i.values.astype(int)
+    #print(geno[:, idx])
+    #print(clump.slope)
+    prs = geno[:, idx].dot(clump.slope)
+    #print(prs)
+    #print(np.corrcoef(prs, pheno.PHENO)[1, 0] ** 2)
+    est = np.corrcoef(prs, pheno.PHENO)[1, 0] ** 2
+    return est
+
+
+def get_index(parameter_tuple):
+    all_clumps, p_thr, sum_stats, train_p, train_g = parameter_tuple
+    space = []
+    for ld_thr in all_clumps.keys():
+        clumped = all_clumps[ld_thr]
+        index_snps = [k[0] for k in clumped.keys() if k[1] < p_thr]
+        if not index_snps:
+            r2 = 0
+        else:
+            try:
+                r2 = just_score(index_snps, sum_stats, train_p, train_g)
+            except Exception:
+                with open('failed.pickle', 'wb') as F:
+                    pickle.dump((index_snps, sum_stats, train_p, train_g), F)
+                    raise
+        space.append((ld_thr, p_thr, index_snps, r2, pd.concat(clumped.values()
+                                                               )))
+    return space
 
 
 class PRS(object):
     def __init__(self, geno, sum_stats, kbwindow=1000, ld_range=None,
-                 pval_range=None, extend=False, check=False, memory=None,
-                 threads=1, re_normalize=True):
+                 pval_range=None, extend=False, check=True, memory=None,
+                 threads=1, re_normalize=True, client=None):
         self.cache = None
         self.memory = memory
         self.threads = threads
+        self.client = client
         self.extend = extend
         self.check = check
         self.bim = None
@@ -86,16 +147,23 @@ class PRS(object):
         self.kbwindow = kbwindow
         self.sum_stats = sum_stats
         self.loci = None
-        self.clumps = {}
+        self.all_clumps = {}
         self.ld_range = ld_range
         self.re_normalize = re_normalize
         self.best = None
         self.pval_range = pval_range
+        self.train_p = None
+        self.test_p = None
+        self.train_g = None
+        self.test_g = None
 
+    def __deepcopy__(self):
+        return self
 
     @property
     def pval_range(self):
         return self.__pval_range
+
     @pval_range.setter
     def pval_range(self, pval_range):
         if pval_range is None:
@@ -107,6 +175,7 @@ class PRS(object):
     @property
     def ld_range(self):
         return self.__ld_range
+
     @ld_range.setter
     def ld_range(self, ld_range):
         if ld_range is None:
@@ -168,14 +237,17 @@ class PRS(object):
                 i = np.concatenate([idx_a[::-1][:-1], nidx, idx_b[::-1][1:]])
                 # Re-subset the genotype arrays with the extensions
                 g = g[:, i]
-                # Compute the correltion as X'X/N
-                rho = da.dot(self.g.T, self.g) / g.shape[0]
+                # normalize for correlation computation
+                g = (g - g.mean(axis=0)) / g.std(axis=0)
+                # Compute the correlation as X'X/N
+                rho = da.dot(g.T, g) / g.shape[0]
                 # remove the extras
                 idx = np.arange(i.shape[0])[
                       idx_a.shape[0] - 1: (nidx.shape[0] + idx_b.shape[0])]
                 rho = rho[idx, :]
                 rho = rho[:, idx]
             else:
+                g = (g - g.mean(axis=0)) / g.std(axis=0)
                 # Just compute the correlations
                 rho = da.dot(g.T, g) / g.shape[0]
             gc.collect()
@@ -240,38 +312,56 @@ class PRS(object):
         # r = pd.concat(r)
         # dd.to_parquet(r, 'ld.matrix')
         # self.loci = r
-        
-    def clumps(self, locus, ld_threshold):
+
+    def clumps(self, tuple_param, pbar):
         """
         Get clumps from locus
         :param sum_stats: subset of the summary statistics for the locus
         :param ld_threshold: the threshold for this run
         """
+        all_clumps = {}
+        locus, ld_thr = tuple_param
+        pbar.set_description(desc="Clumping with %f LD threshold" % ld_thr)
+        pbar.refresh()
         ascend = True
         # unpack the locus tuple
         snp_list, d = locus
         # Name the rows and columns
-        d = pd.DataFrame(d, index=snp_list, columns=snp_list)
+        snp_list = snp_list.to_list()
+        with dask.config.set(num_workers=self.threads):
+            nd = (d ** 2 > ld_thr).compute()
+        gr = Graph.Adjacency(nd.tolist())
+        gr.vs['label'] = snp_list
+        # d = pd.DataFrame(d.compute(), index=snp_list, columns=snp_list)
         # subset sum_stats
-        sum_stats = self.sum_stats[self.sum_stats.snp.isin(snp_list)].copy(
-            deep=True)
         # Get the clumps pfr this locus
-        while not sum_stats.empty:
-            # get the index snp
-            index = sum_stats.nsmallest(1, 'pvalue')
-            # get the clump around index for
-            vec = (d ** 2).loc[index.snp, :]
-            tag = vec[vec > ld_threshold].index.tolist()
-            # Subset the sumary statistic dataframe with the snps in the clump
-            sub_stats = sum_stats[sum_stats.snp.isin(tag)]
-            key = (index.snp, index.pvalue)
-            self.clumps[key] = sub_stats 
-            # remove the clumped snps from the summary statistics dataframe
-            sum_stats = sum_stats[~sum_stats.snp.isin(tag)]
+        grs = gr.components().subgraphs()
+        for clump in grs:
+            tag = clump.vs['label']
+            sub_stats = self.sum_stats[self.sum_stats.snp.isin(tag)]
+            index = sub_stats.nsmallest(1, 'pvalue')
+            key = (index.snp.values[0], index.pvalue.values[0])
+            all_clumps[key] = sub_stats
+            pbar.update()
+            #total = len(self.ld_range) * len(self.loci)
+        # while not sum_stats.empty:
+        #     # get the index snp
+        #     index = sum_stats.nsmallest(1, 'pvalue')
+        #     # get the clump around index for
+        #     vec = (d ** 2).loc[index.snp, :]
+        #     tag = vec[vec > ld_threshold].index.tolist()
+        #     # Subset the sumary statistic dataframe with the snps in the clump
+        #     sub_stats = sum_stats[sum_stats.snp.isin(tag)]
+        #     key = (index.snp.values[0], index.pvalue.values[0])
+        #     all_clumps[key] = sub_stats
+        #     # remove the clumped snps from the summary statistics dataframe
+        #     sum_stats = sum_stats[~sum_stats.snp.isin(tag)]
+
+        return ld_thr, all_clumps
 
     def compute_clumps(self, ld_threshold):
         """
-    
+
         :param loci: list of tuples with the LDs and snps per locus
         :param sum_stats: sumary statistics
         :param ld_threshold: trheshold for cumping
@@ -283,32 +373,41 @@ class PRS(object):
         :param memory: max memory to use
         :return: dictionary with the clumps
         """
-        opts = dict(sum_stats=sum_stats, ld_threshold=ld_threshold)
-        delayed_results = [dask.delayed(self.clumps)(locus=locus, **opts) 
-                           for locus in self.loci]
-        with ProgressBar():
-            print("Identifying clumps with R2 threshold = %.3f" % ld_threshold)
-            d_opt = dict(
-            l = list(dask.compute(*delayed_results, num_workers=self.threads,
-                                  memory_limit=self.memory, cache=self.cache,
-                                  pool=ThreadPool(self.threads))))
-        #return dict(pair for d in l for pair in d.items())
 
-    @staticmethod
-    def just_score(index_snp, sumstats, pheno, geno):
-        clump = sumstats[sumstats.snp.isin(index_snp)]
-        idx = clump.i.values.astype(int)
-        prs = geno[:, idx].dot(clump.slope)
-        est = np.corrcoef(prs, pheno.PHENO)[1, 0] ** 2
-        return est
+        delayed_results = [dask.delayed(self.clumps)(locus, ld_threshold)
+                           for locus in self.loci]
+        pbar = ProgressBar()
+        config = dask.config.set(num_workers=self.threads,
+                                 memory_limit=self.memory, cache=self.cache,
+                                 pool=ThreadPool(self.threads))
+        with pbar, config:
+            #print("Identifying clumps with R2 threshold = %.3f" % ld_threshold)
+            l = list(dask.compute(*delayed_results))
+        return dict(pair for d in l for pair in d.items())
+
+    def get_index(self, parameter_tuple):
+        all_clumps, by_threshold = parameter_tuple
+        rank = operator.lt
+        index_snps = [k[0] for k in all_clumps.keys() if rank(k[0] + 1,
+                                                              by_threshold)]
+        if not index_snps:
+            r2 = 0
+        else:
+            try:
+                r2 = self.just_score(index_snps, self.sum_stats, self.train_p,
+                                     self.train_g)
+            except Exception:
+                with open('failed.pickle', 'wb') as F:
+                    pickle.dump((index_snps, self.sum_stats, self.train_p,
+                                 self.train_g), F)
+                    raise
+        # pbar.update()
+        return (index_snps, r2, pd.concat(all_clumps.values()))
 
     def optimize_it(self, test_geno, test_pheno):
         """
         Optimize the R2 based on summary statistics
         """
-        rank = getattr(operator, 'lt')
-        snp_index = 0
-        curr_best = ([], 0)
         # Optimize with one split, return reference score with the second
         out = train_test_split(test_geno, test_pheno, test_size=0.5)
         train_g, test_g, train_p, test_p = out
@@ -316,27 +415,38 @@ class PRS(object):
             # re-normalize the genotypes
             train_g = (train_g - train_g.mean(axis=0)) / train_g.std(axis=0)
             test_g = (test_g - test_g.mean(axis=0)) / test_g.std(axis=0)
-        for ld_threshold in self.ld_range:
-            all_clumps = self.compute_clumps(ld_threshold)
-            for by_threshold in self.pval_range:
-                index_snps = [k[snp_index] for k in all_clumps.keys() if
-                              rank(k[snp_index + 1], by_threshold)]
-                if not index_snps:
-                    continue
-                try:
-                    r2 = self.just_score(index_snps, self.sum_stats, train_p,
-                                    train_g)
-                except Exception:
-                    with open('failed.pickle', 'wb') as F:
-                        pickle.dump((index_snps, sum_stats, train_p, train_g),
-                                    F)
-                        raise
-                if r2 > curr_best[1]:
-                    curr_best = (index_snps, r2, pd.concat(all_clumps.values())
-                                 )
-        r2 = self.just_score(curr_best[0], sum_stats, test_p, test_g)
-        best = namedtuple('best', ('indices', 'r2', 'clumps'))
-        self.best = best(curr_best[0], r2, curr_best[-1])
+        self.train_g, self.test_g = train_g.compute(), test_g
+        self.train_p, self.test_p = train_p, test_p
+        assert np.isnan(self.train_g).any()
+        # combos = product(self.loci, self.ld_range)
+        combos = product(self.loci, self.ld_range)
+        delayed_results = [dask.delayed(clumps)(
+            self.sum_stats[self.sum_stats.snp.isin(locus[0])], locus, ld_thr)
+            for locus, ld_thr in combos]
+        opts = dict(num_workers=self.threads, cache=self.cache,
+                    scheduler='processes')
+        print('\tGet clumps')
+        with ProgressBar(), dask.config.set(**opts):
+            clumped = list(dask.compute(*delayed_results))
+        del combos, delayed_results
+        gc.collect()
+        clumped = dict(clumped)
+        combos = product([clumped], self.pval_range, [self.sum_stats],
+                         [self.train_p], [self.train_g])
+        delayed_results = [dask.delayed(get_index)(param_tuple)
+                           for param_tuple in combos]
+        print('\tGet index and score')
+        with ProgressBar(), dask.config.set(**opts):
+            results = list(dask.compute(*delayed_results))
+        results = list(chain.from_iterable(results))
+        del combos
+        gc.collect()
+        res = sorted(results, key=lambda x: x[3], reverse=True)
+        curr_best = res[0][2:]
+        #print(curr_best)
+        r2 = just_score(curr_best[0], self.sum_stats, test_p, test_g)
+        best = namedtuple('best', ('indices', 'r2', 'clumps', 'ld', 'pval'))
+        self.best = best(curr_best[0], r2, curr_best[-1], res[0][0], res[0][1])
 
 
 # ----------------------------------------------------------------------
@@ -401,10 +511,9 @@ def read_geno(bfile, freq_thresh, threads, flip=False, check=False,
     # remove invariant sites
     if check:
         g_std = g.std(axis=1)
-        with ProgressBar():
+        with ProgressBar(), dask.config.set(pool=ThreadPool(threads)):
             print('Removing invariant sites')
-            with dask.config.set(pool=ThreadPool(threads)):
-                idx = (g_std != 0).compute(cache=cache)
+            idx = (g_std != 0).compute(cache=cache)
         g = g[idx, :]
         bim = bim[idx].copy().reset_index(drop=True)
         bim.i = bim.index.tolist()
@@ -441,7 +550,7 @@ def read_geno(bfile, freq_thresh, threads, flip=False, check=False,
                 good, mafs = dask.compute(good, mafs, cache=cache)
         g = g[:, good]
         print('    Genotype matrix shape after', g.shape)
-        print(bim.shape)
+        #print(bim.shape)
         bim = bim[good]
         bim['mafs'] = mafs[good]
         del good
@@ -457,9 +566,9 @@ def read_geno(bfile, freq_thresh, threads, flip=False, check=False,
 
 
 class GWAS(object):
-    def __init__(self, filesetprefix, pheno, outprefix, threads, check=False,
-                 freq_thresh=0.01, flip=False, max_memory=None, seed=None,
-                 usable_snps=None, **kwargs):
+    def __init__(self, filesetprefix, pheno, outprefix, threads, client=None,
+                 check=False, freq_thresh=0.01, flip=False, max_memory=None,
+                 seed=None, usable_snps=None, **kwargs):
         self.bed = []
         self.bim = None
         self.fam = None
@@ -469,6 +578,7 @@ class GWAS(object):
         self.usable_snps = usable_snps
         self.outpref = outprefix
         self.threads = threads
+        self.client = client
         self.max_memory = max_memory
         self.flip = flip
         self.check = check
@@ -481,6 +591,18 @@ class GWAS(object):
         self.y_train = None
         self.y_test = None
         self.p_values = None
+        print(self.__dict__)
+    # @property
+    # def client(self):
+    #     return self.__client
+    #
+    # @client.setter
+    # def client(self, client):
+    #     if client is None:
+    #         self.__client = Client(threads_per_worker=self.threads,
+    #                                n_workers=cpu_count())
+    #     else:
+    #         self.__client = client
 
     @property
     def geno(self):
@@ -526,7 +648,7 @@ class GWAS(object):
 
         elif isinstance(self.pheno, str):
             # If pheno is provided as a string, read it
-            pheno = pd.read_table(self.pheno, delim_whitespace=True,
+            pheno = pd.read_csv(self.pheno, delim_whitespace=True,
                                   header=None, names=['fid', 'iid', 'PHENO'])
         else:
             pheno = self.pheno
@@ -583,8 +705,8 @@ class GWAS(object):
     #     return w
 
     @staticmethod
-    @jit(nopython=True, parallel=True)
-    def nu_linregress(x, y):
+    #@jit(nopython=True, parallel=True)
+    def nu_linregress(param_tuple, pbar):
         """
         Refactor of the scipy linregress with mpmath in the estimation of the
         pvalue, numba, and less checks for speed sake
@@ -593,6 +715,7 @@ class GWAS(object):
         :param y: array for the dependent variable
         :return: dictionary with slope, intercept, r, pvalue and stderr
         """
+        x, y = param_tuple
         cols = ['slope', 'intercept', 'rvalue', 'pvalue', 'stderr']
         # Make sure x and y are arrays
         x = np.asarray(x)
@@ -622,10 +745,11 @@ class GWAS(object):
         prob = 2 * t_sf(t, df)
         # get the estimated standard error
         sterrest = np.sqrt((1 - r * r) * ssym / ssxm / df)
+        pbar.update()
         return dict(zip(cols, [slope, intercept, r, prob, sterrest]))
 
     @staticmethod
-    @jit(nopython=True, parallel=True)
+    #@jit(nopython=True, parallel=True)
     def high_precision_pvalue(df, r):
         r = r if np.abs(r) != 1.0 else mp.mpf(0.9999999999999999) * mp.sign(r)
         den = ((1.0 - r) * (1.0 + r))
@@ -667,8 +791,8 @@ class GWAS(object):
         plt.close()
 
     @staticmethod
-    @jit(parallel=True)
-    def st_mod(x, y, covs=None):
+    #@jit(parallel=True)
+    def st_mod(param_tuple, pbar):
         """
         Linear regression using stats models. This module is very slow but
         allows to include covariates in the estimation.
@@ -678,6 +802,11 @@ class GWAS(object):
         :param covs: array for covariates
         :return: Regression results
         """
+        if len(param_tuple) == 2:
+            x, y = param_tuple
+            covs = None
+        else:
+            x, y, covs = param_tuple
         df = pd.DataFrame({'geno': x, 'pheno': y})
         cols = ['slope', 'intercept', 'rvalue', 'pvalue', 'stderr', 'b_pval',
                 'b_std_err']
@@ -698,10 +827,18 @@ class GWAS(object):
                     results.pvalues.Intercept, results.pvalues.geno,
                     results.rsquared, results.bse.Intercept, results.bse.geno]
             linregress_result = dict(zip(cols, vals))
+        pbar.update()
         return linregress_result
 
     @staticmethod
-    @jit(parallel=True)
+    def linregress(param_tuple, pbar):
+        x, y = param_tuple
+        linregress_result = linregress(x, y)
+        pbar.update()
+        return linregress_result
+
+    @staticmethod
+    #@jit(parallel=True)
     def do_pca(g, n_comp):
         """
         Perform a PCA on the genetic array and return n_comp of it
@@ -738,7 +875,7 @@ class GWAS(object):
         # Get the testing set of the phenotype
         y_test = pd.read_hdf(pfn, key='y_test')
         # Read the resulting gwas table
-        res = pd.read_csv('%s.gwas' % prefix, sep='\t')
+        res = pd.read_csv('%s.gwas' % self.outpref, sep='\t')
         return res, x_train, x_test, y_train, y_test
     
     def plink_free_gwas(self, validate=None, plot=False, causal_pos=None,
@@ -768,6 +905,8 @@ class GWAS(object):
             else:
                 x_train, x_test = self.geno, self.geno
                 y_train, y_test = self.pheno, self.pheno
+            assert not da.isnan(x_train).any().compute(threads=self.threads)
+            # assert np.isnan(x_test).any()
             # write test and train IDs
             opts = dict(sep=' ', index=False, header=False)
             y_test.to_csv('%s_testIDs.txt' % self.outpref, **opts)
@@ -785,27 +924,29 @@ class GWAS(object):
                                                                          )
             # Get apropriate function for linear regression
             func = self.nu_linregress if high_precision else self.st_mod \
-                if stmd else lr
-            daskpheno = dask.delayed(y_train.PHENO)
-            daskgeno = dask.delayed(x_train)
+                if stmd else self.linregress
+            daskpheno = da.from_array(y_train.PHENO)
             if pca is not None:
                 print('Using %d PCs' % pca)
                 #Perform PCA
                 func = st_mod                   # Force function to statsmodels
                 covs = self.do_pca(x_train, pca)     # Estimate PCAs
-                delayed_results = [
-                    dask.delayed(func)(daskgeno[:, i], daskpheno, covs=covs) for
-                    i in range(x_train.shape[1])]
+                combos = product((x_train[:, x] for x in range(
+                    x_train.shape[1])), [daskpheno], covs)
             else:
-                delayed_results = [dask.delayed(func)(daskgeno[:, i], daskpheno
-                                                      )
-                                   for i in range(x_train.shape[1])]
-            dask_options = dict(num_workers=threads, cache=self.cache,
-                                pool=ThreadPool(threads))
-            with ProgressBar(), dask.config.set(**dask_options):
-                print('Performing regressions')
-                r = list(dask.compute(*delayed_results))
-                gc.collect()
+                combos = product((x_train[:, x] for x in range(
+                    x_train.shape[1])), [daskpheno])
+
+            tq = dict(desc='Performing regressions', total=x_train.shape[1])
+            print(x_train.shape, daskpheno.shape)
+            lr = LinearRegression()
+            with ProgressBar(), Client(LocalCluster()):
+                r = x_train.apply(lr.fit, 1, x_train, daskpheno)
+            # with Pool(self.threads) as p, tqdm(**tq) as pbar, \
+            #         warnings.catch_warnings():
+            #     warnings.simplefilter('ignore')
+            #     r = p.starmap(func, product(combos, [pbar]))
+            gc.collect()
             try:
                 res = pd.DataFrame.from_records(r, columns=r[0]._fields)
             except AttributeError:
@@ -818,10 +959,10 @@ class GWAS(object):
             if not zeros.empty and not stmd and high_precision_on_zero:
                 print('    Processing zeros with arbitrary precision')
                 df = x_train.shape[0] - 2
-                dr = [dask.delayed(high_precision_pvalue)(df, r) for r in
-                      zeros.rvalue.values]
-                with ProgressBar(), dask.config.set(**dask_options):
-                    zero_res = np.array(dask.compute(*dr))
+                combos = product(df, zeros.rvalue.values)
+                with ThreadPool(self.threads) as p:
+                    results = p.starmap(self.high_precision_pvalue, combos)
+                zero_res = np.array(*results)
                 res.loc[res.pvalue == 0.0, 'pvalue'] = zero_res
                 res['pvalue'] = [mp.mpf(z) for z in res.pvalue]
             self.p_values = res.pvalue.values
@@ -830,7 +971,6 @@ class GWAS(object):
                 self.manhattan_plot(causal_pos, alpha=plot)
             # write files
             res.to_csv('%s.gwas' % self.outpref, sep='\t', index=False)
-
             labels = ['/x_train', '/x_test']
             arrays = [x_train, x_test]
             hdf_opt = dict(table=True, mode='a', format="table")
@@ -856,20 +996,30 @@ def do_gwas(geno, pheno, sum_stats, outprefix, threads, max_memory, validate=2,
     #                                 check=kwargs['check'],
     #                                 max_memory=max_memory)
     if sum_stats is not None:
-        sum_stats = pd.read_table(sum_stats, delim_whitespace=True)
+        sum_stats = pd.read_csv(sum_stats, delim_whitespace=True)
         gwas = namedtuple(gwas, ('fam', 'bim', 'geno', 'sum_stats', 'x_train',
                                  'x_test', 'y_train', 'y_test'))
         gwas = gwas(kwargs['fam'], kwargs['bim'], geno, sum_stats, None, None,
                     None, None)
     else:
-        gwas = GWAS(geno, pheno, outprefix, threads, max_memory)
-        gwas.plink_free_gwas(validate=validate)
+        gwas = GWAS(geno, pheno, outprefix, threads, max_memory, **kwargs)
+        gwas.plink_free_gwas(validate=validate, **kwargs)
 
     return gwas
 
 
+def set_cluster_type(cluster, **kwargs):
+    if cluster.lower() == 'local':
+        cluster = LocalCluster()
+    else:
+        cluster = SLURMCluster(**kwargs)
+    client = Client(cluster)
+    return client
+
+
 def main(geno, pheno, outprefix, sum_stats=None, max_memory=None, threads=1,
-         pval_range=None, ld_range=None, **kwargs):
+         pval_range=None, ld_range=None, client=None, **kwargs):
+    print(client)
     print('Performing P + T')
     if isinstance(geno, str):
         if geno.endswith('.bed'):
@@ -883,11 +1033,61 @@ def main(geno, pheno, outprefix, sum_stats=None, max_memory=None, threads=1,
                       **kwargs) for g in geno]
         bim, fam, geno, sum_stats = zip(*gw)
         sum_stats = pd.concat(sum_stats)
+        x_test, y_test = geno, pheno
     else:
         gwas = do_gwas(geno, pheno, sum_stats, outprefix, threads, max_memory,
                        **kwargs)
         bim, fam, geno = gwas.bim, gwas.fam, gwas.geno
         sum_stats = gwas.sum_stats
-
+        x_test, y_test = gwas.x_test, gwas.y_test
     prs = PRS((bim, fam, geno), sum_stats, threads=threads, memory=max_memory,
-              pval_range=pval_range, ld_range=ld_range)
+              pval_range=pval_range, ld_range=ld_range, client=client)
+    prs.optimize_it(x_test, y_test)
+    print(prs.best)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        prog='PROG', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('geno', help='Genotype file (bed filename)')
+    parser.add_argument('prefix', help='prefix for outputs')
+    parser.add_argument('-f', '--pheno', help='Phenotype file', default=None)
+    parser.add_argument('-v', '--validate', default=None, type=int,
+                        help='Use pseudo crossvalidation')
+    parser.add_argument('-t', '--threads', default=1, type=int,
+                        help='Number of cpus')
+    parser.add_argument('-M', '--maxmem', default=None, type=int)
+    parser.add_argument('--f_thr', type=float, default=0,
+                        help='Keyword argument for read_geno. The frequency '
+                              'threshold to cleanup the genotype file')
+    parser.add_argument('--flip', action='store_true', default=False,
+                        help='Keyword argument for read_geno. Whether to flip '
+                             'the genotypes when MAF is > 0.5')
+    parser.add_argument('--check', action='store_true', default=False,
+                        help='Keyword argument for read_geno. Whether to '
+                             'check the genotypes for invariant columns.')
+    parser.add_argument('--normalize', action='store_true',
+                        help='Keyword argument for qtraits_simulation. '
+                             'Whether to normalize the genotype or not.')
+    parser.add_argument('-s', '--sumstats', default=None,
+                        help='Filename with summary statistics (previous gwas)'
+                        )
+    parser.add_argument('-p', '--pval_range', default=None,
+                        help='Range of pvalues to explore')
+    parser.add_argument('-r', '--ld_range', default=None, help='Range of R2 to'
+                                                               ' explore')
+    parser.add_argument('--cluster', default="local", help='local or slurm')
+    parser.add_argument('--processes', default=None, help='Number of processes'
+                                                          ' in a slurm cluster'
+                        )
+    parser.add_argument('--project', default=None, help='Name of your cluster'
+                                                        ' account')
+    parser.add_argument('--walltime', default="01:00:00", help='Time required')
+
+    args = parser.parse_args()
+
+    # client = set_cluster_type(args.cluster, processes=args.processes,
+    #                           project=args.project, walltime=args.walltime)
+    main(args.geno, args.pheno, args.prefix, args.sumstats, client=args.cluster,
+         threads=args.threads,  memory=args.maxmem, validate=args.validate,
+         freq_thresh=args.f_thr, check=args.check)
