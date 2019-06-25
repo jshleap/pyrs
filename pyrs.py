@@ -929,7 +929,9 @@ class GWAS(object):
             # Get apropriate function for linear regression
             func = self.nu_linregress if high_precision else self.st_mod \
                 if stmd else self.linregress
-            daskpheno = da.from_array(y_train.PHENO)
+            daskpheno = da.from_array(y_train.PHENO,
+                                      chunks=(y_train.PHENO.shape[0])).astype(
+                float)
             if pca is not None:
                 print('Using %d PCs' % pca)
                 #Perform PCA
@@ -942,11 +944,12 @@ class GWAS(object):
                     x_train.shape[1])), [daskpheno])
 
             tq = dict(desc='Performing regressions', total=x_train.shape[1])
-            print(x_train.shape, daskpheno.shape)
+            print(x_train.shape, daskpheno.shape, x_train.numblocks, daskpheno.numblocks)
             lr = LinearRegression()
             print('Performing regressions')
             with ProgressBar(), Client(LocalCluster()):
-                r = x_train.map_blocks(func).compute()
+                r = x_train.map_blocks(func, daskpheno, dtype=np.float,
+                                       new_axis=[]).compute()
             # with Pool(self.threads) as p, tqdm(**tq) as pbar, \
             #         warnings.catch_warnings():
             #     warnings.simplefilter('ignore')
