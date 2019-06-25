@@ -831,10 +831,9 @@ class GWAS(object):
         return linregress_result
 
     @staticmethod
-    def linregress(param_tuple, pbar):
+    def linregress(param_tuple):
         x, y = param_tuple
         linregress_result = linregress(x, y)
-        pbar.update()
         return linregress_result
 
     @staticmethod
