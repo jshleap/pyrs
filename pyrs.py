@@ -916,7 +916,7 @@ class GWAS(object):
             y_test.to_csv('%s_testIDs.txt' % self.outpref, **opts)
             y_train.to_csv('%s_trainIDs.txt' % self.outpref, **opts)
             if isinstance(x_train, dask.array.core.Array):
-                x_train = x_train.rechunk((x_train.shape[0], 1))
+                x_train = x_train.rechunk((x_train.shape[0], 1)).astype(int)
                 # x_train = x_train.rechunk(
                 #     estimate_chunks(x_train.shape, threads, max_memory))
             if 'normalize' in kwargs:
