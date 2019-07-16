@@ -87,7 +87,14 @@ def single_locus_clump(clump, sum_stats):
     tag = clump.vs['label']
     sub_stats = sum_stats[sum_stats.snp.isin(tag)]
     index = sub_stats.nsmallest(1, 'pvalue')
-    key = (index.snp.values[0], index.pvalue.values[0])
+    try:
+        key = (index.snp.values[0], index.pvalue.values[0])
+    except IndexError:
+        print(tag)
+        print(sum_stats)
+        print(sub_stats)
+        raise
+
     return key, sub_stats
 
 
@@ -98,9 +105,17 @@ def clumps(sum_stats, locus, ld_thr):
     :param ld_threshold: the threshold for this run
     """
     snp_list, d = locus
+    boole = snp_list.isin(sum_stats.snp)
     # Name the rows and columns
-    snp_list = snp_list.to_list()
-    gr = Graph.Adjacency((d ** 2 > ld_thr).tolist())
+    snp_list = snp_list[boole].to_list()
+    d2 = d[boole, :]
+    d2 = d2[:, boole]
+    try:
+        gr = Graph.Adjacency((d2 ** 2 > ld_thr).tolist())
+    except TypeError:
+        print(snp_list)
+        print(d.shape, d2.shape)
+        raise
     gr.vs['label'] = snp_list
     grs = gr.components().subgraphs()
     clumped = [single_locus_clump(clump, sum_stats) for clump in grs]
@@ -150,7 +165,7 @@ def get_index(parameter_tuple):
             try:
                 r2 = just_score(index_snps, sum_stats, train_p, train_g)
             except Exception:
-                with open('failed.pickle', 'wb') as F:
+                with open('failed.pckl', 'wb') as F:
                     dill.dump((index_snps, sum_stats, train_p, train_g), F)
                     raise
         space.append((ld_thr, p_thr, index_snps, r2, pd.concat(clumped.values()
@@ -301,7 +316,7 @@ class PRS(object):
         Get the LD blocks in one population
         """
         # set Cache to protect memory spilling
-        rp = 'r.pickle'
+        rp = 'r.pckl'
         if os.path.isfile(rp):
             with open(rp, 'rb') as pckl:
                 r = dill.load(pckl)
@@ -423,7 +438,7 @@ class PRS(object):
                 r2 = just_score(index_snps, self.sum_stats, self.train_p,
                                 self.train_g)
             except Exception:
-                with open('failed.pickle', 'wb') as F:
+                with open('failed.pckl', 'wb') as F:
                     dill.dump((index_snps, self.sum_stats, self.train_p,
                                  self.train_g), F)
                     raise
@@ -471,7 +486,7 @@ class PRS(object):
         opts = dict(num_workers=self.threads, cache=self.cache,
                     scheduler='threads')
         print('\tGet clumps')
-        pcklfile = 'clumps.pickl'
+        pcklfile = 'clumps.pckl'
         if os.path.isfile(pcklfile):
             with open(pcklfile, 'rb') as p:
                 clumped = dill.load(p)
@@ -674,7 +689,7 @@ class GWAS(object):
     @pheno.setter
     def pheno(self, pheno):
         if pheno is None:
-            options = dict(outprefix=self.outpref, bfile=self.geno, h2=0.9,
+            options = dict(outprefix=self.outpref, bfile=self.geno, h2=0.5,
                            ncausal=10, normalize=True, uniform=False,
                            snps=None, seed=self.seed, bfile2=None,
                            flip=self.flip, max_memory=self.max_memory,
