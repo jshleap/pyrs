@@ -23,7 +23,8 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.stats import linregress
 from sklearn.model_selection import train_test_split
-
+from dask.distributed import Client, LocalCluster
+from dask_jobqueue import SLURMCluster
 from qtraitsimulation import qtraits_simulation
 
 
@@ -41,7 +42,7 @@ def estimate_chunks(shape, threads, memory=None):
     """
     total = psutil.virtual_memory().available  # a tenth of the memory
     avail_mem = total if memory is None else memory  # Set available memory
-    size = (reduce(np.multiply, shape) * 8) / 1E6
+    size = (reduce(np.multiply, shape) * 8) #/ 1E6
     usage = size * threads  # Compute threaded estimated size
     # Determine number of chunks given usage and available memory
     n_chunks = np.ceil(usage / avail_mem).astype(int)
@@ -50,6 +51,15 @@ def estimate_chunks(shape, threads, memory=None):
         estimated = tuple(np.array(shape) / n_chunks)  # Get chunk estimation
     chunks = min(shape, tuple(estimated))            # Fix if n_chunks is 0
     return tuple(int(i) for i in chunks)  # Ensure chunks as tuple of integers
+
+
+# -----------------------------------------------------------------------------
+def is_transposed(g, famshape, bimshape):
+    if g.shape[0] == famshape:
+        return False
+    else:
+        assert g.shape[0] == bimshape
+        return True
 
 
 # -----------------------------------------------------------------------------
@@ -173,6 +183,7 @@ class GWAS(object):
             # If pheno is provided as a string, read it
             pheno = pd.read_csv(pheno, delim_whitespace=True, header=None,
                                 names=['fid', 'iid', 'PHENO'])
+            pheno = pheno[pheno.iid.isin(self.fam.iid.tolist())]
         # else:
         #     pheno = self.__pheno
         try:
@@ -239,7 +250,8 @@ class GWAS(object):
             del g_std, idx
             gc.collect()
         if usable_snps is not None:
-            idx = bim[bim.snp.isin(usable_snps)].i.tolist()
+            idx = bim[bim.snp.isin(usable_snps)].i.values
+            idx.sort()
             g = g[idx, :]
             bim = bim[bim.i.isin(idx)].copy().reset_index(drop=True)
             bim.i = bim.index.tolist()
@@ -565,6 +577,7 @@ class PRS(object):
                  snp_list=None, outpref='prs', cv=3, freq_thresh=0.1,
                  normalize=True, **kargs):
         self.kwargs = kargs
+        self.outpref = outpref
         self.normalize = normalize
         self.cache = None
         self.memory = memory
@@ -576,7 +589,6 @@ class PRS(object):
         self.geno = bedfileset
         self.sum_stats = sum_stats
         self.ld_range = ld_range
-        self.outpref = outpref
         self.pheno = pheno
         self.pval_range = pval_range
         self.snp_list = snp_list
@@ -622,13 +634,13 @@ class PRS(object):
     def geno(self, geno):
         if isinstance(geno, str):
             op = dict(check=self.check, max_memory=self.memory,
-                      normalize=self.normalize)
+                      normalize=self.normalize, prefix=self.outpref)
             out = self.read_geno(geno, self.freq_thresh, self.threads, **op)
             g, self.bim, self.fam = out
         elif isinstance(geno, tuple):
             self.bim, self.fam, g = geno
-            if not self.is_transposed(g, self.bim.shape[0], self.fam.shape[0]):
-                g = g.t
+            if not is_transposed(g, self.bim.shape[0], self.fam.shape[0]):
+                g = g.T
         else:
             assert isinstance(geno, da.core.Array)
             g = geno
@@ -637,16 +649,8 @@ class PRS(object):
             0], g.shape[1]))
 
     @staticmethod
-    def is_transposed(g, famshape, bimshape):
-        if g.shape[0] == famshape:
-            return True
-        else:
-            assert g.shape[0] == bimshape
-            return False
-
-    @staticmethod
     def read_geno(bfile, freq_thresh, threads, check=False, max_memory=None,
-                  usable_snps=None, normalize=False):
+                  usable_snps=None, normalize=False, prefix='my_geno'):
         # set Cache to protect memory spilling
         if max_memory is not None:
             available_memory = max_memory
@@ -654,7 +658,7 @@ class PRS(object):
             available_memory = psutil.virtual_memory().available
         cache = Chest(available_memory=available_memory)
         (bim, fam, g) = read_plink(bfile)  # read the files using pandas_plink
-        g_std = g.std(axis=1)
+        g_std = da.nanstd(g, axis=1)
         if check:
             with ProgressBar(), dask.config.set(pool=ThreadPool(threads)):
                 print('Removing invariant sites')
@@ -662,14 +666,15 @@ class PRS(object):
             g = g[idx, :]
             bim = bim[idx].copy().reset_index(drop=True)
             bim.i = bim.index.tolist()
+            g_std = g_std[idx]
             del idx
             gc.collect()
         if usable_snps is not None:
-            idx = bim[bim.snp.isin(usable_snps)].i.tolist()
+            idx = sorted(bim[bim.snp.isin(usable_snps)].i.values)
             g = g[idx, :]
             bim = bim[bim.i.isin(idx)].copy().reset_index(drop=True)
             bim.i = bim.index.tolist()
-        mafs = g.sum(axis=1) / (2 * n) if freq_thresh > 0 else None
+        mafs = g.sum(axis=1) / (2 * g.shape[0]) if freq_thresh > 0 else None
         # Filter MAF
         if freq_thresh > 0:
             print('Filtering MAFs smaller than', freq_thresh)
@@ -684,13 +689,20 @@ class PRS(object):
             print('    Genotype matrix shape after', g.shape)
             bim = bim[good]
             bim['mafs'] = mafs[good]
+            bim.reset_index(drop=True, inplace=True)
+            bim.i = bim.index.tolist()
             del good
             gc.collect()
-        if normalize:
-            mean = g.mean(axis=1)
-            g = (g.T - mean) / g_std
-        else:
+        if not is_transposed(g, bim.shape[0], fam.shape[0]):
             g = g.T
+        if normalize:
+            mean = da.nanmean(g, axis=1)
+            g = (g.T - mean).T / g_std
+        d = {'/%s' % chrom: g[:, sorted(df.i.values)].rechunk((10000, 10000))
+             for chrom, df in bim.groupby('chrom')}
+        if not os.path.isfile('%s.hdf5' % prefix):
+            da.to_hdf5('%s.hdf5' % prefix, d)
+
         return g, bim, fam
 
     @property
@@ -702,7 +714,9 @@ class PRS(object):
         if isinstance(pheno, str):
             opt = dict(delim_whitespace=True, header=None,
                        names=['fid', 'iid', 'pheno'])
-            self.__pheno = pd.read_csv(pheno, **opt)
+            df = pd.read_csv(pheno, **opt)
+            df = df[df.iid.isin(self.fam.iid.tolist())]
+            self.__pheno = df
         elif isinstance(pheno,  pd.core.frame.DataFrame):
             self.__pheno = pheno
         else:
@@ -720,12 +734,23 @@ class PRS(object):
 
     @sum_stats.setter
     def sum_stats(self, sum_stats):
+        mapping = {'BETA': 'slope', 'P': 'pvalue', 'SNP': 'snp', 'BP': 'pos'}
         if isinstance(sum_stats, str):
-            self.__sum_stats = pd.read_csv(sum_stats, sep='\t')
+            df = pd.read_csv(sum_stats, sep='\t')
+            if ('BETA' in df.columns) and ('P' in df.columns):
+                df = df.rename(columns=mapping)
+            #self.__sum_stats = df
         elif isinstance(sum_stats, pd.core.frame.DataFrame):
-            self.__sum_stats = sum_stats
+            #self.__sum_stats = sum_stats
+            df = sum_stats
         else:
             raise NotImplementedError
+        df = df.reindex(columns=['snp', 'pos', 'slope', 'pvalue'])
+        df = df.rename(columns=dict(zip(df.columns, df.columns.str.lower())))
+        df = df.rename(columns={'chr': 'chrom'})
+        if 'i' not in df.columns:
+            df = df.merge(self.bim, on=['pos', 'snp'])
+        self.__sum_stats = df
 
     @property
     def memory(self):
@@ -744,16 +769,41 @@ class PRS(object):
         return self.__rho
 
     @rho.setter
-    def rho(self, ng):
-        self.__rho = (da.dot(ng.T, ng) / ng.shape[0]) ** 2
+    def rho(self, _):
+        if not os.path.isfile('%s_ld.hdf5' % self.outpref):
+            with h5py.File('%s.hdf5' % self.outpref) as f:
+                d = {'/%s' % chrom: da.corrcoef(
+                    da.ma.masked_invalid(da.from_array(f[str(chrom)])).T) ** 2
+                     for chrom, df in self.bim.groupby('chrom')}
+                da.to_hdf5('%s_ld.hdf5' % self.outpref, d)
+        # ng = ng.rechunk((10000, 50000))
+        # d = {}
+        # for chrom, df in self.bim.groupby('chrom'):
+        #     sub = ng[:, df.i.values]
+        #     d[chrom] = da.corrcoef(da.ma.masked_invalid(sub).T) **2
+        #     #(da.dot(sub.T, sub) / sub.shape[0]) ** 2
+        self.__rho = h5py.File('%s_ld.hdf5' % self.outpref)  #(da.dot(ng.T, ng) / ng.shape[0]) ** 2
+
+    def compute_n_subset_rho(self, ng, arr_indices, chrom):
+        sub = ng[:, arr_indices]
+        sub = (da.dot(sub.T, sub) / sub.shape[0]) ** 2
+        return chrom, sub
 
     def get_clumps(self, ld_thr):
-        # get clumps
-        G_sparse = csr_matrix((self.rho >= ld_thr).compute().astype(int))
-        n_comp, lab = connected_components(csgraph=G_sparse, directed=False,
-                                           return_labels=True)
         clump = self.bim.copy(deep=True)
-        clump['clumps'] = lab
+        # get clumps
+        for chrom, df in self.bim.groupby('chrom'):
+            print('Processing clumps for Chromosome', chrom)
+            rho = da.from_array(self.rho[chrom])
+            sp_arr = (rho >= ld_thr).astype(int)
+            del rho
+            gc.collect()
+            G_sparse = csr_matrix(sp_arr)
+            n_comp, lab = connected_components(
+                csgraph=G_sparse, directed=False, return_labels=True)
+            clump.loc[df.index, 'clumps'] = lab
+            del G_sparse
+            gc.collect()
         return clump
 
     def pval_thresholding(self, clump, pv_thr):
@@ -766,23 +816,32 @@ class PRS(object):
     def score(self, geno, pheno, ld_thr, pv_thr):
         clump = self.get_clumps(ld_thr)
         index = self.pval_thresholding(clump, pv_thr)
-        prs = geno[:, index.i.values].dot(index.slope)
+        prs = geno[:, sorted(index.i.values)].dot(index.slope)
+        print('PRS done for', ld_thr, 'R2 and a pvalue threshold of', pv_thr)
         pheno = pheno.copy()
         pheno['prs'] = prs
+        print('Computing R2 with true phenotype')
         r2 = pheno.reindex(columns=['pheno', 'prs']).corr().loc[
                  'pheno', 'prs'] ** 2
         return pheno, index, ld_thr, pv_thr, r2
 
     def compute_prs(self):
         param_space = product(self.pval_range, self.ld_range)
-        out = train_test_split(self.geno, self.pheno, test_size=1/self.cv)
+        if self.cv is None:
+            out = (self.g, self.g, self.pheno, self.pheno)
+        else:
+            out = train_test_split(self.geno, self.pheno, test_size=1/self.cv)
         train_g, test_g, train_p, test_p = out
-        delayed_results = [dask.delayed(self.score)(train_g, train_p, ld, pv)
-                           for pv, ld in param_space]
+        # delayed_results = [dask.delayed(self.score)(train_g, train_p, ld, pv)
+        #                    for pv, ld in param_space]
+        result = []
         with ProgressBar():
-            print('Computing PRS')
-            result = list(dask.compute(*delayed_results, scheduler='threads'))
-        best = sorted(result, key=lambda tup: tup[-1], reverse = True)[0]
+            for pv, ld in param_space:
+                print('Computing PRS with R2 of', ld,'and pvalue threshold of',
+                      pv)
+                result.append(self.score(train_g, train_p, ld, pv))
+            # result = list(dask.compute(*delayed_results, scheduler='threads'))
+        best = sorted(result, key=lambda tup: tup[-1], reverse=True)[0]
         print('Best result achieved with LD prunning over %.2f and evlaue of '
               '%.2e, rendering an R2 of %.3f' % (best[2], best[3], best[4]))
         print('Index snps in training set:')
@@ -812,7 +871,8 @@ def main(geno, pheno, outpref, pval_range, ld_range, gwas, threads, covs,
             pval_range=pval_range, memory=memory, threads=threads,
             snp_list=snp_subset, outpref=outpref, cv=validate,
             freq_thresh=freq_thresh)
-    p.compute_prs()
+    r2 = p.compute_prs()
+    return r2, p
 
 
 if __name__ == '__main__':
@@ -846,8 +906,22 @@ if __name__ == '__main__':
                         help='subset of SNPs to analyse')
     parser.add_argument('-c', '--covs', default=None,
                         help='covariates for GWAS')
+    parser.add_argument('--SLURM', default=None,
+                        help='Use slurm scheduler to use multinode cluster. '
+                             'Here you need to provide (in that order): 1) '
+                             'account, cpus per node, 3) time, 4) memory, and '
+                             '5) number of nodes to use, as a comma separated '
+                             'string (e.g. --SLURM def-account,32,00:30:00,'
+                             '32GB)')
 
     args = parser.parse_args()
+    if args.SLURM is not None:
+        project, cpus, t, mem = args.SLURM.split(',')
+        cluster = SLURMCluster(cores=cpus, project=project, memory=mem, time=t)
+    else:
+        cluster = LocalCluster()
+    client = Client(cluster)
+
     main(args.geno, args.pheno, args.prefix, args.pval_range, args.ld_range,
          gwas=args.sumstats, check=args.check, threads=args.threads,
          covs=args.covs, memory=args.maxmem, validate=args.validate,

@@ -134,6 +134,7 @@ class GWAS(object):
         self.y_test = None
         self.p_values = None
         self.covs = covs
+        self.__dict__.update(kwargs)
         print(self.__dict__)
 
     @property
@@ -587,10 +588,11 @@ class PRS(object):
     def __init__(self, bedfileset, sum_stats, pheno=None, ld_range=None,
                  pval_range=None, check=True, memory=None, threads=1,
                  snp_list=None, outpref='prs', cv=3, freq_thresh=0.1,
-                 normalize=True, **kargs):
-        self.kwargs = kargs
+                 normalize=True, seed=None, **kwargs):
+        self.__dict__.update(kwargs)
         self.normalize = normalize
         self.cache = None
+        self.seed = seed
         self.memory = memory
         self.threads = threads
         self.check = check
@@ -611,6 +613,14 @@ class PRS(object):
 
     def __deepcopy__(self):
         return self
+
+    @property
+    def seed(self):
+        return self.__seed
+
+    @seed.setter
+    def seed(self, seed):
+        self.__seed = np.random.randint(1e4) if seed is None else seed
 
     @property
     def pval_range(self):
@@ -652,7 +662,7 @@ class PRS(object):
         elif isinstance(geno, tuple):
             self.bim, self.fam, g = geno
             if not self.is_transposed(g, self.bim.shape[0], self.fam.shape[0]):
-                g = g.t
+                g = g.T
         else:
             assert isinstance(geno, da.core.Array)
             g = geno
@@ -715,6 +725,7 @@ class PRS(object):
             g = (g.T - mean) / g_std
         else:
             g = g.T
+
         return g, bim, fam
 
     @property
@@ -726,14 +737,16 @@ class PRS(object):
         if isinstance(pheno, str):
             opt = dict(delim_whitespace=True, header=None,
                        names=['fid', 'iid', 'pheno'])
-            self.__pheno = pd.read_csv(pheno, **opt)
+            df = pd.read_csv(pheno, **opt)
+            df = df[df.iid.isin(self.fam.iid.tolist())]
+            self.__pheno = df
         elif isinstance(pheno,  pd.core.frame.DataFrame):
             self.__pheno = pheno
         else:
             options = dict(outprefix=self.outpref, bfile=self.geno, h2=0.5,
                            ncausal=10, normalize=True, uniform=False,
                            snps=None, seed=self.seed, bfile2=None,
-                           max_memory=self.max_memory, bim=self.bim,
+                           max_memory=self.memory, bim=self.bim,
                            fam=self.fam, high_precision_on_zero=False)
             self.__pheno, h2, gen = qtraits_simulation(**options)
             g, b, self.truebeta, self.causals = gen
