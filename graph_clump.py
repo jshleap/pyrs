@@ -4,7 +4,7 @@ import time
 from functools import reduce
 from itertools import cycle, product
 from multiprocessing.pool import ThreadPool
-
+import warnings
 import dask
 import dask.array as da
 import gc
@@ -596,6 +596,7 @@ class PRS(object):
         self.cv = cv
         self.index = None
         self.best = None
+        self.last_sp_arr = None
 
     def __deepcopy__(self):
         return self
@@ -645,7 +646,7 @@ class PRS(object):
             assert isinstance(geno, da.core.Array)
             g = geno
         self.__geno = g
-        print('Gentotype file with %d individuals and %d variants' % (g.shape[
+        print('Genotype file with %d individuals and %d variants' % (g.shape[
             0], g.shape[1]))
 
     @staticmethod
@@ -736,12 +737,10 @@ class PRS(object):
     def sum_stats(self, sum_stats):
         mapping = {'BETA': 'slope', 'P': 'pvalue', 'SNP': 'snp', 'BP': 'pos'}
         if isinstance(sum_stats, str):
-            df = pd.read_csv(sum_stats, sep='\t')
+            df = pd.read_csv(sum_stats, delim_whitespace=True)
             if ('BETA' in df.columns) and ('P' in df.columns):
                 df = df.rename(columns=mapping)
-            #self.__sum_stats = df
         elif isinstance(sum_stats, pd.core.frame.DataFrame):
-            #self.__sum_stats = sum_stats
             df = sum_stats
         else:
             raise NotImplementedError
@@ -776,18 +775,7 @@ class PRS(object):
                     da.ma.masked_invalid(da.from_array(f[str(chrom)])).T) ** 2
                      for chrom, df in self.bim.groupby('chrom')}
                 da.to_hdf5('%s_ld.hdf5' % self.outpref, d)
-        # ng = ng.rechunk((10000, 50000))
-        # d = {}
-        # for chrom, df in self.bim.groupby('chrom'):
-        #     sub = ng[:, df.i.values]
-        #     d[chrom] = da.corrcoef(da.ma.masked_invalid(sub).T) **2
-        #     #(da.dot(sub.T, sub) / sub.shape[0]) ** 2
-        self.__rho = h5py.File('%s_ld.hdf5' % self.outpref)  #(da.dot(ng.T, ng) / ng.shape[0]) ** 2
-
-    def compute_n_subset_rho(self, ng, arr_indices, chrom):
-        sub = ng[:, arr_indices]
-        sub = (da.dot(sub.T, sub) / sub.shape[0]) ** 2
-        return chrom, sub
+        self.__rho = h5py.File('%s_ld.hdf5' % self.outpref)
 
     def get_clumps(self, ld_thr):
         clump = self.bim.copy(deep=True)
@@ -795,15 +783,20 @@ class PRS(object):
         for chrom, df in self.bim.groupby('chrom'):
             print('Processing clumps for Chromosome', chrom)
             rho = da.from_array(self.rho[chrom])
-            sp_arr = (rho >= ld_thr).astype(int)
+            sp_arr = (rho >= ld_thr).compute()
             del rho
             gc.collect()
-            G_sparse = csr_matrix(sp_arr)
-            n_comp, lab = connected_components(
-                csgraph=G_sparse, directed=False, return_labels=True)
+            if sp_arr.all():
+                lab = [0] * sp_arr.shape[0]
+            elif (~sp_arr).all():
+                lab = range(sp_arr.shape[0])
+            else:
+                G_sparse = csr_matrix(sp_arr)
+                n_comp, lab = connected_components(
+                    csgraph=G_sparse, directed=False, return_labels=True)
+                del G_sparse
+                gc.collect()
             clump.loc[df.index, 'clumps'] = lab
-            del G_sparse
-            gc.collect()
         return clump
 
     def pval_thresholding(self, clump, pv_thr):
@@ -815,14 +808,15 @@ class PRS(object):
 
     def score(self, geno, pheno, ld_thr, pv_thr):
         clump = self.get_clumps(ld_thr)
-        index = self.pval_thresholding(clump, pv_thr)
-        prs = geno[:, sorted(index.i.values)].dot(index.slope)
+        index = self.pval_thresholding(clump, pv_thr).sort_values('i')
+        prs = geno[:, index.i.values].dot(index.slope)
         print('PRS done for', ld_thr, 'R2 and a pvalue threshold of', pv_thr)
         pheno = pheno.copy()
         pheno['prs'] = prs
         print('Computing R2 with true phenotype')
         r2 = pheno.reindex(columns=['pheno', 'prs']).corr().loc[
                  'pheno', 'prs'] ** 2
+        print(r2)
         return pheno, index, ld_thr, pv_thr, r2
 
     def compute_prs(self):
@@ -830,8 +824,14 @@ class PRS(object):
         if self.cv is None:
             out = (self.g, self.g, self.pheno, self.pheno)
         else:
+            warnings.simplefilter(action='ignore',
+                                  category=pd.errors.PerformanceWarning)
             out = train_test_split(self.geno, self.pheno, test_size=1/self.cv)
         train_g, test_g, train_p, test_p = out
+        train_g = train_g.rechunk(estimate_chunks(train_g.shape,  self.threads,
+                                                  memory=self.memory))
+        test_g = test_g.rechunk(estimate_chunks(test_g.shape,  self.threads,
+                                                memory=self.memory))
         # delayed_results = [dask.delayed(self.score)(train_g, train_p, ld, pv)
         #                    for pv, ld in param_space]
         result = []
@@ -906,22 +906,22 @@ if __name__ == '__main__':
                         help='subset of SNPs to analyse')
     parser.add_argument('-c', '--covs', default=None,
                         help='covariates for GWAS')
-    parser.add_argument('--SLURM', default=None,
-                        help='Use slurm scheduler to use multinode cluster. '
-                             'Here you need to provide (in that order): 1) '
-                             'account, cpus per node, 3) time, 4) memory, and '
-                             '5) number of nodes to use, as a comma separated '
-                             'string (e.g. --SLURM def-account,32,00:30:00,'
-                             '32GB)')
+    # parser.add_argument('--SLURM', default=None,
+    #                     help='Use slurm scheduler to use multinode cluster. '
+    #                          'Here you need to provide (in that order): 1) '
+    #                          'account, cpus per node, 3) time, 4) memory, and '
+    #                          '5) number of nodes to use, as a comma separated '
+    #                          'string (e.g. --SLURM def-account,32,00:30:00,'
+    #                          '32GB)')
 
     args = parser.parse_args()
-    if args.SLURM is not None:
-        project, cpus, t, mem = args.SLURM.split(',')
-        cluster = SLURMCluster(cores=cpus, project=project, memory=mem, time=t)
-    else:
-        cluster = LocalCluster()
-    client = Client(cluster)
-
+    # if args.SLURM is not None:
+    #     project, cpus, t, mem = args.SLURM.split(',')
+    #     cluster = SLURMCluster(cores=cpus, project=project, memory=mem, time=t)
+    # else:
+    #     cluster = LocalCluster(n_workers=args.threads, processes=False)
+    # client = Client(cluster)
+    dask.config.set(scheduler='threads', num_workers=args.threads)
     main(args.geno, args.pheno, args.prefix, args.pval_range, args.ld_range,
          gwas=args.sumstats, check=args.check, threads=args.threads,
          covs=args.covs, memory=args.maxmem, validate=args.validate,
