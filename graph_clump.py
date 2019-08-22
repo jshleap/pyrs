@@ -575,10 +575,11 @@ class PRS(object):
     def __init__(self, bedfileset, sum_stats, pheno=None, ld_range=None,
                  pval_range=None, check=True, memory=None, threads=1,
                  snp_list=None, outpref='prs', cv=3, freq_thresh=0.1,
-                 normalize=True, **kargs):
+                 normalize=True, thinning=None, **kargs):
         self.kwargs = kargs
         self.outpref = outpref
         self.normalize = normalize
+        self.thinning = thinning
         self.cache = None
         self.memory = memory
         self.threads = threads
@@ -809,7 +810,11 @@ class PRS(object):
     def score(self, geno, pheno, ld_thr, pv_thr):
         clump = self.get_clumps(ld_thr)
         index = self.pval_thresholding(clump, pv_thr).sort_values('i')
-        prs = geno[:, index.i.values].dot(index.slope)
+        sub = geno[:, index.i.values]
+        genotype = da.ma.masked_array(sub, mask=da.isnan(sub))
+        eff_size = da.ma.masked_array(index.slope, mask=da.isnan(index.slope))
+        prs = genotype.dot(eff_size)
+        #geno[:, index.i.values].dot(index.slope)
         print('PRS done for', ld_thr, 'R2 and a pvalue threshold of', pv_thr)
         pheno = pheno.copy()
         pheno['prs'] = prs
@@ -857,7 +862,7 @@ class PRS(object):
 
 
 def main(geno, pheno, outpref, pval_range, ld_range, gwas, threads, covs,
-         memory, validate, freq_thresh, check, snp_subset, **kwargs):
+         memory, validate, freq_thresh, check, snp_subset, thining, **kwargs):
     if gwas is None:
         gwas = GWAS(geno, pheno, outpref, threads, covs=covs, check=check,
                     max_memory=memory, freq_thresh=freq_thresh)
@@ -870,7 +875,7 @@ def main(geno, pheno, outpref, pval_range, ld_range, gwas, threads, covs,
     p = PRS(geno, gwas, pheno=pheno, ld_range=ld_range, check=check,
             pval_range=pval_range, memory=memory, threads=threads,
             snp_list=snp_subset, outpref=outpref, cv=validate,
-            freq_thresh=freq_thresh)
+            freq_thresh=freq_thresh, thinning=thining)
     r2 = p.compute_prs()
     return r2, p
 
@@ -906,6 +911,9 @@ if __name__ == '__main__':
                         help='subset of SNPs to analyse')
     parser.add_argument('-c', '--covs', default=None,
                         help='covariates for GWAS')
+    parser.add_argument('-n', '--thinning', default=None,
+                        help='Use at most this number of variants uniformingly '
+                             'distributed')
     # parser.add_argument('--SLURM', default=None,
     #                     help='Use slurm scheduler to use multinode cluster. '
     #                          'Here you need to provide (in that order): 1) '
@@ -925,4 +933,5 @@ if __name__ == '__main__':
     main(args.geno, args.pheno, args.prefix, args.pval_range, args.ld_range,
          gwas=args.sumstats, check=args.check, threads=args.threads,
          covs=args.covs, memory=args.maxmem, validate=args.validate,
-         freq_thresh=args.f_thr, snp_subset=args.snp_subset)
+         freq_thresh=args.f_thr, snp_subset=args.snp_subset,
+         thinning=args.thinning)
