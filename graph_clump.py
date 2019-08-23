@@ -599,6 +599,8 @@ class PRS(object):
         self.index = None
         self.best = None
         self.last_sp_arr = None
+        self.clumps = None
+        self.self.gwast = None
 
     def __deepcopy__(self):
         return self
@@ -820,7 +822,7 @@ class PRS(object):
                 clump.loc[df.index, 'clumps_%.2f' % ld_thr] = lab
         return clump
 
-    def pval_thresholding(self, clump):#, clump, pv_thr):
+    def pval_thresholding(self):#, clump, pv_thr):
         ss = self.sum_stats.copy(deep=True)
         for pv_thr in self.pval_range:
             pas = ss.pvalue <= pv_thr
@@ -828,7 +830,7 @@ class PRS(object):
             #gwas = gwas[~pd.isnull(gwas.slope)]
             # merged = clump.merge(gwas, on=['snp', 'i'])
             # merged.sort_values(by='pvalue', ascending=True, inplace=True)
-        merged = clump.merge(ss, on=['snp', 'i'])
+        merged = self.clumps.merge(ss, on=['snp', 'i'])
         return merged #merged.groupby('clumps').first()
 
     @staticmethod
@@ -857,9 +859,9 @@ class PRS(object):
 
     def score(self, geno, pheno):#, ld_thr, pv_thr):
         param_space = product(sorted(self.pval_range), self.ld_range)
-        clump = self.get_clumps()#ld_thr)
-        gwast = self.pval_thresholding(clump)#, pv_thr, ld_thr).sort_values('i')
-        results = [self.process_pair(gwast, geno, pheno, pv, ld)
+        self.clumps = self.get_clumps()#ld_thr)
+        self.gwast = self.pval_thresholding()#, pv_thr, ld_thr).sort_values('i')
+        results = [self.process_pair(self.gwast, geno, pheno, pv, ld)
                    for pv, ld in param_space]
         results = [x for x in results if x is not None]
         return results
@@ -894,7 +896,8 @@ class PRS(object):
         print(best[1])
         print('Applyting to test set')
         with ProgressBar():
-            actual_r2 = self.score(test_g, test_p, best[2], best[3])
+            actual_r2 = self.process_pair(self.gwast, test_g, test_p, best[2],
+                                          best[3])
             print('R2 in testset is', actual_r2[-1])
         actual_r2[0].to_csv('%s.prs' % self.outpref, sep='\t', index=False)
         actual_r2[1].to_csv('%s.indices' % self.outpref, sep='\t', index=False)
