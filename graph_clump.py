@@ -635,9 +635,11 @@ class PRS(object):
     @geno.setter
     def geno(self, geno):
         if isinstance(geno, str):
-            op = dict(check=self.check, max_memory=self.memory,
-                      normalize=self.normalize, prefix=self.outpref)
-            out = self.read_geno(geno, self.freq_thresh, self.threads, **op)
+            op = dict(bfile=geno, freq_thresh=self.freq_thresh,
+                      threads=self.threads, check=self.check,
+                      normalize=self.normalize, max_memory=self.memory,
+                      prefix=self.outpref, thinning=self.thinning)
+            out = self.read_geno(**op)
             g, self.bim, self.fam = out
         elif isinstance(geno, tuple):
             self.bim, self.fam, g = geno
@@ -652,7 +654,9 @@ class PRS(object):
 
     @staticmethod
     def read_geno(bfile, freq_thresh, threads, check=False, max_memory=None,
-                  usable_snps=None, normalize=False, prefix='my_geno'):
+                  usable_snps=None, normalize=False, prefix='my_geno',
+                  thinning=None):
+        chunks = (10000, 10000)
         # set Cache to protect memory spilling
         if max_memory is not None:
             available_memory = max_memory
@@ -662,7 +666,7 @@ class PRS(object):
         (bim, fam, g) = read_plink(bfile)  # read the files using pandas_plink
         g_std = da.nanstd(g, axis=1)
         if check:
-            with ProgressBar(), dask.config.set(pool=ThreadPool(threads)):
+            with ProgressBar():
                 print('Removing invariant sites')
                 idx = (g_std != 0).compute(cache=cache)
             g = g[idx, :]
@@ -672,6 +676,7 @@ class PRS(object):
             del idx
             gc.collect()
         if usable_snps is not None:
+            print('Restricting genotype to user specified variants')
             idx = sorted(bim[bim.snp.isin(usable_snps)].i.values)
             g = g[idx, :]
             bim = bim[bim.i.isin(idx)].copy().reset_index(drop=True)
@@ -698,13 +703,27 @@ class PRS(object):
         if not is_transposed(g, bim.shape[0], fam.shape[0]):
             g = g.T
         if normalize:
+            print('Normalizing to mean 0 and sd 1')
             mean = da.nanmean(g, axis=1)
             g = (g.T - mean).T / g_std
-        d = {'/%s' % chrom: g[:, sorted(df.i.values)].rechunk((10000, 10000))
-             for chrom, df in bim.groupby('chrom')}
+        if thinning is not None:
+            print("Thinning genotype to %d variants" % thinning)
+            idx = np.linspace(0, g.shape[1], num=thinning, dtype=int,
+                              endpoint=False)
+            bim = bim.reindex(index=idx)
+            g = g[:, idx]
+            bim['i'] = range(thinning)
         if not os.path.isfile('%s.hdf5' % prefix):
-            da.to_hdf5('%s.hdf5' % prefix, d)
-
+            with ProgressBar(), h5py.File('%s.hdf5' % prefix, 'w') as hd5:
+                print("Sending processed genotype to HDF5")
+                for chrom, df in bim.groupby('chrom'):
+                    ch = g[:, df.i.values]
+                    print('\tChromosome %s: %d individuals %d  variants' % (
+                        chrom, ch.shape[0], ch.shape[1]))
+                    hd5.create_dataset('/%s' % chrom,  data=ch.compute())
+                # d = {'/%s' % chrom: g[:, df.i.values].compute()
+                #      for chrom, df in bim.groupby('chrom')}
+                # da.to_hdf5('%s.hdf5' % prefix, d)
         return g, bim, fam
 
     @property
@@ -778,54 +797,74 @@ class PRS(object):
                 da.to_hdf5('%s_ld.hdf5' % self.outpref, d)
         self.__rho = h5py.File('%s_ld.hdf5' % self.outpref)
 
-    def get_clumps(self, ld_thr):
+    def get_clumps(self):#, ld_thr):
         clump = self.bim.copy(deep=True)
         # get clumps
         for chrom, df in self.bim.groupby('chrom'):
             print('Processing clumps for Chromosome', chrom)
             rho = da.from_array(self.rho[chrom])
-            sp_arr = (rho >= ld_thr).compute()
-            del rho
-            gc.collect()
-            if sp_arr.all():
-                lab = [0] * sp_arr.shape[0]
-            elif (~sp_arr).all():
-                lab = range(sp_arr.shape[0])
-            else:
-                G_sparse = csr_matrix(sp_arr)
-                n_comp, lab = connected_components(
-                    csgraph=G_sparse, directed=False, return_labels=True)
-                del G_sparse
-                gc.collect()
-            clump.loc[df.index, 'clumps'] = lab
+            for ld_thr in self.ld_range:
+                print('\tLD threshold = %.2f' % ld_thr)
+                sp_arr = (rho >= ld_thr).compute()
+                if sp_arr.all():
+                    lab = [0] * sp_arr.shape[0]
+                elif (~sp_arr).all():
+                    lab = range(sp_arr.shape[0])
+                else:
+                    G_sparse = csr_matrix(sp_arr)
+                    n_comp, lab = connected_components(
+                        csgraph=G_sparse, directed=False, return_labels=True)
+                    del G_sparse, sp_arr
+                    gc.collect()
+                clump.loc[df.index, 'clumps_%.2f' % ld_thr] = lab
         return clump
 
-    def pval_thresholding(self, clump, pv_thr):
-        gwas = self.sum_stats[self.sum_stats.pvalue <= pv_thr]
-        gwas = gwas[~pd.isnull(gwas.slope)]
-        merged = clump.merge(gwas, on=['snp', 'i'])
-        merged.sort_values(by='pvalue', ascending=True, inplace=True)
-        return merged.groupby('clumps').first()
+    def pval_thresholding(self, clump):#, clump, pv_thr):
+        ss = self.sum_stats.copy(deep=True)
+        for pv_thr in self.pval_range:
+            pas = ss.pvalue <= pv_thr
+            ss['pvthr_%.2f' % pv_thr] = pas
+            #gwas = gwas[~pd.isnull(gwas.slope)]
+            # merged = clump.merge(gwas, on=['snp', 'i'])
+            # merged.sort_values(by='pvalue', ascending=True, inplace=True)
+        merged = clump.merge(ss, on=['snp', 'i'])
+        return merged #merged.groupby('clumps').first()
 
-    def score(self, geno, pheno, ld_thr, pv_thr):
-        clump = self.get_clumps(ld_thr)
-        index = self.pval_thresholding(clump, pv_thr).sort_values('i')
-        sub = geno[:, index.i.values]
-        genotype = da.ma.masked_array(sub, mask=da.isnan(sub))
-        eff_size = da.ma.masked_array(index.slope, mask=da.isnan(index.slope))
-        prs = genotype.dot(eff_size)
-        #geno[:, index.i.values].dot(index.slope)
-        print('PRS done for', ld_thr, 'R2 and a pvalue threshold of', pv_thr)
-        pheno = pheno.copy()
-        pheno['prs'] = prs
-        print('Computing R2 with true phenotype')
-        r2 = pheno.reindex(columns=['pheno', 'prs']).corr().loc[
-                 'pheno', 'prs'] ** 2
-        print(r2)
-        return pheno, index, ld_thr, pv_thr, r2
+    @staticmethod
+    def process_pair(gwast, geno, pheno,  pv, ld ):
+        print('Computing PRS with R2 of', ld, 'and pvalue threshold of', pv)
+        index = gwast[gwast.loc[:, 'pvthr_%.2f' % pv].values]
+        index = index.sort_values(by='pvalue', ascending=True).groupby(
+            'clumps_%.2f' % ld).first()
+        if not index.empty:
+            sub = geno[:, sorted(index.i.values)]
+            genotype = da.ma.masked_array(sub, mask=da.isnan(sub))
+            eff_size = da.ma.masked_array(index.slope, mask=da.isnan(
+                index.slope))
+            prs = genotype.dot(eff_size)
+            # geno[:, index.i.values].dot(index.slope)
+            print('PRS done for', ld, 'R2 and a pvalue threshold of', pv)
+            pheno = pheno.copy()
+            pheno['prs'] = prs
+            print('Computing R2 with true phenotype')
+            r2 = pheno.reindex(columns=['pheno', 'prs']).corr().loc[
+                     'pheno', 'prs'] ** 2
+            print(r2)
+            return pheno, index, ld, pv, r2
+        else:
+            print('\tNo variant left after prunning...Skipping')
+
+    def score(self, geno, pheno):#, ld_thr, pv_thr):
+        param_space = product(sorted(self.pval_range), self.ld_range)
+        clump = self.get_clumps()#ld_thr)
+        gwast = self.pval_thresholding(clump)#, pv_thr, ld_thr).sort_values('i')
+        results = [self.process_pair(gwast, geno, pheno, pv, ld)
+                   for pv, ld in param_space]
+        results = [x for x in results if x is not None]
+        return results
 
     def compute_prs(self):
-        param_space = product(self.pval_range, self.ld_range)
+
         if self.cv is None:
             out = (self.g, self.g, self.pheno, self.pheno)
         else:
@@ -839,12 +878,13 @@ class PRS(object):
                                                 memory=self.memory))
         # delayed_results = [dask.delayed(self.score)(train_g, train_p, ld, pv)
         #                    for pv, ld in param_space]
-        result = []
+        # result = []
         with ProgressBar():
-            for pv, ld in param_space:
-                print('Computing PRS with R2 of', ld,'and pvalue threshold of',
-                      pv)
-                result.append(self.score(train_g, train_p, ld, pv))
+            result = self.score(train_g, train_p)
+            # for pv, ld in param_space:
+            #     print('Computing PRS with R2 of', ld,'and pvalue threshold of',
+            #           pv)
+            #     result.append(self.score(train_g, train_p, ld, pv))
             # result = list(dask.compute(*delayed_results, scheduler='threads'))
         best = sorted(result, key=lambda tup: tup[-1], reverse=True)[0]
         print('Best result achieved with LD prunning over %.2f and evlaue of '
@@ -862,7 +902,7 @@ class PRS(object):
 
 
 def main(geno, pheno, outpref, pval_range, ld_range, gwas, threads, covs,
-         memory, validate, freq_thresh, check, snp_subset, thining, **kwargs):
+         memory, validate, freq_thresh, check, snp_subset, thinning, **kwargs):
     if gwas is None:
         gwas = GWAS(geno, pheno, outpref, threads, covs=covs, check=check,
                     max_memory=memory, freq_thresh=freq_thresh)
@@ -875,7 +915,7 @@ def main(geno, pheno, outpref, pval_range, ld_range, gwas, threads, covs,
     p = PRS(geno, gwas, pheno=pheno, ld_range=ld_range, check=check,
             pval_range=pval_range, memory=memory, threads=threads,
             snp_list=snp_subset, outpref=outpref, cv=validate,
-            freq_thresh=freq_thresh, thinning=thining)
+            freq_thresh=freq_thresh, thinning=thinning)
     r2 = p.compute_prs()
     return r2, p
 
@@ -911,9 +951,9 @@ if __name__ == '__main__':
                         help='subset of SNPs to analyse')
     parser.add_argument('-c', '--covs', default=None,
                         help='covariates for GWAS')
-    parser.add_argument('-n', '--thinning', default=None,
-                        help='Use at most this number of variants uniformingly '
-                             'distributed')
+    parser.add_argument('-n', '--thinning', default=None, type=int,
+                        help='Use at most this number of variants uniformingly'
+                             ' distributed')
     # parser.add_argument('--SLURM', default=None,
     #                     help='Use slurm scheduler to use multinode cluster. '
     #                          'Here you need to provide (in that order): 1) '
