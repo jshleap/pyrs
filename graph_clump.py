@@ -936,7 +936,7 @@ if __name__ == '__main__':
     parser.add_argument('--f_thr', type=float, default=0,
                         help='Keyword argument for read_geno. The frequency '
                               'threshold to cleanup the genotype file')
-    parser.add_argument('--check', action='store_false', default=True,
+    parser.add_argument('--nocheck', action='store_false', default=True,
                         help='Disable checking the genotypes for invariant '
                              'columns.')
     parser.add_argument('--normalize', action='store_false',
@@ -970,9 +970,15 @@ if __name__ == '__main__':
     # else:
     #     cluster = LocalCluster(n_workers=args.threads, processes=False)
     # client = Client(cluster)
-    dask.config.set(scheduler='threads', num_workers=args.threads)
+    if args.maxmem is not None:
+        available_memory = args.maxmem
+    else:
+        available_memory = psutil.virtual_memory().available
+    cache = Chest(available_memory=available_memory)
+    dask.config.set(scheduler='threads', num_workers=args.threads, 
+                    memory=args.maxmem, cache=cache)
     main(args.geno, args.pheno, args.prefix, args.pval_range, args.ld_range,
-         gwas=args.sumstats, check=args.check, threads=args.threads,
+         gwas=args.sumstats, check=args.nocheck, threads=args.threads,
          covs=args.covs, memory=args.maxmem, validate=args.validate,
          freq_thresh=args.f_thr, snp_subset=args.snp_subset,
          thinning=args.thinning)
