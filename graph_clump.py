@@ -24,8 +24,8 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.stats import linregress
 from sklearn.model_selection import train_test_split
-from dask.distributed import Client, LocalCluster
-from dask_jobqueue import SLURMCluster
+#from dask.distributed import Client, LocalCluster
+#from dask_jobqueue import SLURMCluster
 from qtraitsimulation import qtraits_simulation
 
 
