@@ -17,7 +17,8 @@ import psutil
 import statsmodels.formula.api as smf
 from chest import Chest
 from dask.diagnostics import ProgressBar
-from dask_ml.decomposition import PCA
+#from dask_ml.decomposition import PCA
+from sklearn.decomposition import PCA
 from pandas_plink import read_plink
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
