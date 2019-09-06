@@ -17,17 +17,14 @@ import psutil
 import statsmodels.formula.api as smf
 from chest import Chest
 from dask.diagnostics import ProgressBar
-#from dask_ml.decomposition import PCA
-from sklearn.decomposition import PCA
+from dask_ml.decomposition import PCA
 from pandas_plink import read_plink
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.stats import linregress
 from sklearn.model_selection import train_test_split
-#from dask.distributed import Client, LocalCluster
-#from dask_jobqueue import SLURMCluster
 from qtraitsimulation import qtraits_simulation
-
+from distributed import Client, LocalCluster
 
 # -----------------------------------------------------------------------------
 def estimate_chunks(shape, threads, memory=None):
@@ -51,7 +48,7 @@ def estimate_chunks(shape, threads, memory=None):
     with np.errstate(divide='ignore', invalid='ignore'):
         estimated = tuple(np.array(shape) / n_chunks)  # Get chunk estimation
     chunks = min(shape, tuple(estimated))            # Fix if n_chunks is 0
-    return tuple(int(i) for i in chunks)  # Ensure chunks as tuple of integers
+    return tuple(int(np.ceil(i)) for i in chunks)  # Ensure chunks as tuple of integers
 
 
 # -----------------------------------------------------------------------------
@@ -125,13 +122,13 @@ class GWAS(object):
 
     @property
     def covs(self):
-        return self.__geno
+        return self.__covs
 
     @covs.setter
     def covs(self, covs):
         if isinstance(covs, str):
             self.__covs = pd.read_csv(covs, sep='\t')
-        elif isinstance(covs, pd.core.frame.DataFrame):
+        elif isinstance(covs, pd.core.frame.DataFrame) or covs is None:
             self.__covs = covs
         else:
             raise NotImplementedError
@@ -168,11 +165,10 @@ class GWAS(object):
     def pheno(self, pheno):
         if pheno is None:
             options = dict(outprefix=self.outpref, bfile=self.geno, h2=0.5,
-                           ncausal=10, normalize=True, uniform=False,
-                           snps=None, seed=self.seed, bfile2=None,
-                           flip=self.flip, max_memory=self.max_memory,
-                           fam=self.fam, high_precision_on_zero=False,
-                           bim=self.bim)
+                           ncausal=10, normalize=True, snps=None, bfile2=None,
+                           seed=self.seed, flip=self.flip, fam=self.fam,
+                           bim=self.bim, max_memory=self.max_memory,
+                           high_precision_on_zero=False, uniform=False)
             # If pheno is not provided, simulate it using qtraits_simulation
             options.update(self.kwargs)
             pheno, h2, gen = qtraits_simulation(**options)
@@ -251,6 +247,7 @@ class GWAS(object):
             del g_std, idx
             gc.collect()
         if usable_snps is not None:
+            print('Subsetting to specified SNPs')
             idx = bim[bim.snp.isin(usable_snps)].i.values
             idx.sort()
             g = g[idx, :]
@@ -259,6 +256,7 @@ class GWAS(object):
         # compute the mafs if required
         mafs = g.sum(axis=1) / (2 * n) if flip or freq_thresh > 0 else None
         if flip:
+            print('Checking for flips')
             # check possible flips
             flips = np.zeros(bim.shape[0], dtype=bool)
             flips[np.where(mafs > 0.5)[0]] = True
@@ -291,10 +289,16 @@ class GWAS(object):
         # Fix the i such that it matches the genotype indices
         bim['i'] = bim.index.tolist()
         # Get chunks apropriate with the number of threads
-        g = g.rechunk(
-            estimate_chunks(g.shape, threads, memory=available_memory))
+        print('Rechunking genotype file')
+        print('\tChunks before', g.chunks)
+        g = g.rechunk(estimate_chunks(g.shape, threads, memory=available_memory
+                                      ))
+        print('\tChunks after', g.chunks)
         del mafs
         gc.collect()
+        # with ProgressBar():
+        #     g = g.rechunk('auto')
+
         return bim, fam, g
 
 
@@ -402,7 +406,7 @@ class GWAS(object):
                 cols = covs.columns.tolist()
                 cols = [x for x in cols if x not in ['fid', 'iid']]
                 for col in cols:
-                    n = 'Cov%d' % col
+                    n = 'Cov%s' % str(col)
                     df[n] = covs[:, col]
                     c.append(n)
                 formula = 'pheno ~ geno + %s' % ' + '.join(c)
@@ -430,9 +434,10 @@ class GWAS(object):
         :param n_comp: Number of components sought
         :return: components array
         """
+        cache = Chest(available_memory=available_memory, path=os.getcwd())
         pca = PCA(n_components=n_comp)
         pca = pca.fit_transform(g)
-        return pca
+        return pca.compute(cache=cache)
 
     def load_previous_run(self):
         """
@@ -473,26 +478,34 @@ class GWAS(object):
         now = time.time()
         pfn = '%s_phenos.hdf5' % self.outpref
         gfn = '%s.geno.hdf5' % self.outpref
+        pcn =  '%s.pcs' % self.outpref
+        #daskpheno = da.from_array(self.pheno.PHENO.values).astype(np.float)
+        #daskgeno = self.geno.rechunk({1: self.geno.shape[1]})
         if os.path.isfile(pfn):
             res, x_train, x_test, y_train, y_test = self.load_previous_run()
         else:
             np.random.seed(seed=seed)
             if validate is not None:
+                opt = {'threads':self.threads, 'memory': self.max_memory}
                 print('making the crossvalidation data')
-                x_train, x_test, y_train, y_test = train_test_split(
-                    self.geno, self.pheno, test_size=1 / validate,
-                    random_state=seed)
+                arrays = train_test_split(self.geno, self.pheno,
+                                          random_state=seed,
+                                          test_size=1 / validate)
+                arrays = [arr.rechunk('auto') #estimate_chunks(arr.shape, **opt))
+                          if isinstance(arr, da.core.Array) else arr
+                          for arr in arrays]
+                x_train, x_test, y_train, y_test = arrays
             else:
                 x_train, x_test = self.geno, self.geno
                 y_train, y_test = self.pheno, self.pheno
-            assert not da.isnan(x_train).any().compute(threads=self.threads)
+            #assert not da.isnan(x_train).any().compute(threads=self.threads)
             # write test and train IDs
             opts = dict(sep=' ', index=False, header=False)
             y_test.to_csv('%s_testIDs.txt' % self.outpref, **opts)
             y_train.to_csv('%s_trainIDs.txt' % self.outpref, **opts)
-            if isinstance(x_train, dask.array.core.Array):
-                x_train = x_train.rechunk((x_train.shape[0], 1)).astype(
-                    np.float)
+            # if isinstance(x_train, dask.array.core.Array):
+            #     x_train = x_train.rechunk((x_train.shape[0], 1)).astype(
+            #         np.float)
             if 'normalize' in kwargs:
                 if kwargs['normalize']:
                     print('Normalizing train set to variance 1 and mean 0')
@@ -504,12 +517,21 @@ class GWAS(object):
             # Get apropriate function for linear regression
             func = self.nu_linregress if high_precision else self.st_mod \
                 if stmd else self.linregress
-            daskpheno = da.from_array(y_train.PHENO.values).astype(np.float)
+            if not isinstance(y_train, da.core.Array):
+                daskpheno = da.from_array(y_train.PHENO.values).astype(np.float
+                                                                       )
+            else:
+                daskpheno = y_train
             if pca is not None:
-                print('Using %d PCs' % pca)
-                # Perform PCA
                 func = self.st_mod  # Force function to statsmodels
-                pcs = pd.DataFrame(self.do_pca(x_train, pca))  # Estimate PCAs
+                print('Computing PCs with %d components' % pca)
+                if os.path.isfile(pcn):
+                    pcs = pd.read_csv(pcn, sep='\t')
+                else:
+                    # Perform PCA
+                    with ProgressBar():
+                        pcs = pd.DataFrame(self.do_pca(x_train, pca))  # Estimate PCAs
+                    pcs.to_csv(pcn, sep='\t', index=False)
                 if self.covs is not None:
                     covs_train = y_train.reindex(columns='iid').merge(
                         self.covs,  on=['iid'], how='left')
@@ -520,14 +542,17 @@ class GWAS(object):
                     pcs['iid'] = y_train.iid
                     covs = pcs
                 combos = product((x_train[:, x] for x in range(
-                    x_train.shape[1])), [daskpheno], covs)
+                    x_train.shape[1])), [daskpheno], [covs])
+                delayed_results = [dask.delayed(func)(x, y, cov) for x, y, cov
+                                   in combos]
             else:
                 combos = product((x_train[:, x] for x in range(
                     x_train.shape[1])), [daskpheno])
+                delayed_results = [dask.delayed(func)(x, y) for x, y in combos]
             print('Performing regressions')
-            delayed_results = [dask.delayed(func)(x, y) for x, y in combos]
             with ProgressBar():
-                r = dask.compute(*delayed_results, scheduler='threads')
+                r = dask.compute(*delayed_results, scheduler='threads',
+                                 num_workers=self.threads, cache=self.cache)
             gc.collect()
             try:
                 res = pd.DataFrame.from_records(list(r), columns=r[0]._fields)
@@ -576,8 +601,9 @@ class PRS(object):
     def __init__(self, bedfileset, sum_stats, pheno=None, ld_range=None,
                  pval_range=None, check=True, memory=None, threads=1,
                  snp_list=None, outpref='prs', cv=3, freq_thresh=0.1,
-                 normalize=True, thinning=None, **kargs):
-        self.kwargs = kargs
+                 normalize=True, thinning=None, **kwargs):
+        self.kwargs = kwargs
+        self.seed = None
         self.outpref = outpref
         self.normalize = normalize
         self.thinning = thinning
@@ -601,6 +627,7 @@ class PRS(object):
         self.last_sp_arr = None
         self.clumps = None
         self.self.gwast = None
+
 
     def __deepcopy__(self):
         return self
@@ -714,7 +741,7 @@ class PRS(object):
             idx = np.linspace(0, g.shape[1], num=thinning, dtype=int,
                               endpoint=False)
             bim = bim.reindex(index=idx)
-            g = g[:, idx]
+            g = g[:, idx].rechunk('auto')
             bim['i'] = range(thinning)
         if not os.path.isfile('%s.hdf5' % prefix):
             with ProgressBar(), h5py.File('%s.hdf5' % prefix, 'w') as hd5:
@@ -745,9 +772,9 @@ class PRS(object):
             self.__pheno = pheno
         else:
             options = dict(outprefix=self.outpref, bfile=self.geno, h2=0.5,
-                           ncausal=10, normalize=True, uniform=False,
-                           snps=None, seed=self.seed, bfile2=None,
-                           max_memory=self.max_memory, bim=self.bim,
+                           ncausal=10, normalize=not self.normalize, snps=None,
+                           uniform=False, seed=self.seed, bfile2=None,
+                           max_memory=self.memory, bim=self.bim,
                            fam=self.fam, high_precision_on_zero=False)
             self.__pheno, h2, gen = qtraits_simulation(**options)
             g, b, self.truebeta, self.causals = gen
@@ -784,7 +811,7 @@ class PRS(object):
             self.__memory = memory
         else:
             self.__memory = psutil.virtual_memory().available / 2
-        self.cache = Chest(available_memory=self.__memory)
+        self.cache = Chest(available_memory=self.__memory, path=os.getcwd())
 
     @property
     def rho(self):
@@ -908,8 +935,10 @@ class PRS(object):
 def main(geno, pheno, outpref, pval_range, ld_range, gwas, threads, covs,
          memory, validate, freq_thresh, check, snp_subset, thinning, **kwargs):
     if gwas is None:
+        geno = geno[:geno.rfind('.')] if '.bed' in geno else geno
         gwas = GWAS(geno, pheno, outpref, threads, covs=covs, check=check,
                     max_memory=memory, freq_thresh=freq_thresh)
+        gwas.plink_free_gwas(validate=validate, plot=True, pca=2)
         fam = gwas.fam[gwas.fam.iid.isin(gwas.y_test.iid.tolist())]
         bim = gwas.bim
         geno = (bim, fam, gwas.X_test)
@@ -977,11 +1006,18 @@ if __name__ == '__main__':
         available_memory = args.maxmem
     else:
         available_memory = psutil.virtual_memory().available
-    cache = Chest(available_memory=available_memory)
-    dask.config.set(scheduler='threads', num_workers=args.threads, 
-                    memory=args.maxmem, cache=cache)
+    cache = Chest(available_memory=available_memory, path=os.getcwd())
+    cs = (available_memory >> 20) / args.threads
+    assert cs > 0
+    arr = dask.config.get('array')
+    arr.update({'chunk-size': cs})
+    dask.config.set(scheduler='threads', num_workers=args.threads,
+                    memory=args.maxmem, cache=cache, array=arr)
+    # cluster = LocalCluster()
+    # print(cluster)
+    # client = Client(cluster)
     main(args.geno, args.pheno, args.prefix, args.pval_range, args.ld_range,
          gwas=args.sumstats, check=args.nocheck, threads=args.threads,
          covs=args.covs, memory=args.maxmem, validate=args.validate,
          freq_thresh=args.f_thr, snp_subset=args.snp_subset,
-         thinning=args.thinning)
+            thinning=args.thinning)
