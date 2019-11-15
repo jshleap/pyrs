@@ -851,7 +851,7 @@ def just_score(index_snp, sumstats, pheno, geno):
     try:
         assert not da.isnan(genclump).any()
     except AssertionError:
-        print(da.isnan(geneclump).sum())
+        print(da.isnan(genclump).sum())
     prs = genclump.dot(aclump.slope)
     assert not da.isnan(prs).any()
     assert not pd.isna(pheno.PHENO).any()
