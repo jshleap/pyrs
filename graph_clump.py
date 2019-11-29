@@ -840,17 +840,19 @@ class PRS(object):
     @rho.setter
     def rho(self, _):
         h5 = '%s.hdf5' % self.outpref
-        with h5py.File(h5) as f:
-            r = Parallel(n_jobs=self.threads, prefer="threads")(
-                delayed(self.estimate_ld)(f, chrom, self.threads, self.memory)
-                for chrom in self.bim.chrom.unique())
+        with h5py.File(h5) as f, ProgressBar():
+            r = [self.estimate_ld(f, self.outpref, chrom, self.threads,
+                                  self.memory) for chrom in
+                 self.bim.chrom.unique()]
+            # r = Parallel(n_jobs=self.threads, prefer="threads")(
+            #     delayed(self.estimate_ld)(f, chrom, self.threads, self.memory)
+            #     for chrom in self.bim.chrom.unique())
         self.__rho = dict(r)
         del r
         gc.collect()
 
-
     @staticmethod
-    def estimate_ld(hd5, chromosome, threads, memory):
+    def estimate_ld(hd5, filename, chromosome, threads, memory):
         print("Estimating LD for Chromosome", chromosome)
         dset = hd5['/%s' % chromosome][:]
         chunks = estimate_chunks(dset.shape, threads, memory)
@@ -858,7 +860,20 @@ class PRS(object):
         del dset
         gc.collect()
         rho = da.corrcoef(da.ma.masked_invalid(array).T) ** 2
-        return chromosome, rho
+        filename='%s_ld.hdf5' % filename
+        da.to_hdf5(filename, '/%s' % chromosome, rho)
+        return chromosome, filename
+
+    @property
+    def ld(self):
+        return self.__ld
+
+    @ld.setter
+    def ld(self, chromosome):
+        with h5py.File(self.rho[chromosome]) as hd5:
+            dset = hd5['/%s' % chromosome][:]
+            chunks = estimate_chunks(dset.shape, self.threads, self.memory)
+            self.__ld = da.from_array(dset, chunks=chunks)
 
     def get_clumps(self):
         clump = self.bim.copy(deep=True)
@@ -868,13 +883,13 @@ class PRS(object):
         for chrom in chromosomes:
             df = gr.get_group(str(chrom))
             print('Processing clumps for Chromosome', chrom)
-            rho = self.rho[str(chrom)]
+            self.ld = chrom
             curr_mem = available_memory - psutil.virtual_memory().available
             for ld_thr in self.ld_range:
                 print('\tLD threshold = %.2f' % ld_thr)
                 with ProgressBar(), dask.config.set(
                         memory=curr_mem, scheduler="single-threaded"):
-                    sp_arr = (rho >= ld_thr).compute()
+                    sp_arr = (self.ld >= ld_thr).compute()
                 if sp_arr.all():
                     lab = [0] * sp_arr.shape[0]
                 elif (~sp_arr).all():
@@ -924,7 +939,7 @@ class PRS(object):
                      'pheno', 'prs'] ** 2
             print(r2)
             return pheno, index, ld, pv, r2
-            return pheno, index, ld, pv, r2
+
         else:
             print('\tNo variant left after prunning...Skipping')
 
